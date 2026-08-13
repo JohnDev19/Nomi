@@ -44,6 +44,25 @@ Rules:
 - Never wrap the JSON in backticks.
 """
 
+# Maps tool-call function names the small LLM sometimes emits to our flat intent schema.
+_TOOL_CALL_INTENT_MAP = {
+    "memory_save": "memory_save",
+    "save_memory": "memory_save",
+    "memory_recall": "memory_recall",
+    "recall_memory": "memory_recall",
+    "get_memory": "memory_recall",
+    "add_reminder": "reminder",
+    "set_reminder": "reminder",
+    "create_reminder": "reminder",
+    "add_scheduled_task": "scheduled_task",
+    "create_task": "scheduled_task",
+    "schedule_task": "scheduled_task",
+    "add_trigger_rule": "trigger_rule",
+    "watch_keyword": "trigger_rule",
+    "summarize": "summary",
+    "get_summary": "summary",
+}
+
 
 def _format_memory(rows):
     if not rows:
@@ -52,7 +71,7 @@ def _format_memory(rows):
 
 
 def _extract_json(text):
-    # small free models sometimes still sneak in a bit of extra text, so just grab the {...} chunk
+    """Grab the first {...} block and try to parse it as JSON."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         return None
@@ -60,6 +79,40 @@ def _extract_json(text):
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+
+def _extract_from_tool_call(text):
+    """
+    Recover intent from tool-call syntax that small models sometimes emit instead of plain JSON.
+
+    Example input:
+        <|tool_call_start|>[memory_save(memory_key='work_pref', memory_value='mornings')]<|tool_call_end|>
+
+    Returns the equivalent flat dict our handlers expect, or None if the text doesn't
+    match the expected pattern or the function name isn't one we recognise.
+    """
+    match = re.search(
+        r"<\|tool_call_start\|>\s*\[(\w+)\((.*?)\)\]\s*<\|tool_call_end\|>",
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+
+    func_name = match.group(1)
+    intent = _TOOL_CALL_INTENT_MAP.get(func_name)
+    if not intent:
+        return None
+
+    args_str = match.group(2)
+    args = {}
+    # Handles both single- and double-quoted values: key='val' or key="val"
+    for m in re.finditer(r"(\w+)=['\"]([^'\"]*)['\"]", args_str):
+        args[m.group(1)] = m.group(2)
+
+    result = {"intent": intent, "reply": ""}
+    result.update(args)
+    return result
 
 
 def parse_intent(chat_id, user_text):
@@ -84,10 +137,15 @@ def parse_intent(chat_id, user_text):
     )
 
     content = message.get("content") or ""
+
+    # 1st pass: clean JSON (the happy path)
     parsed = _extract_json(content)
 
+    # 2nd pass: the small LLM emitted tool-call syntax instead of JSON — recover from it
     if not parsed:
-        # model didn't play along, just fall back to treating this as a plain chat turn
+        parsed = _extract_from_tool_call(content)
+
+    if not parsed:
         fallback_reply = content.strip() or "Sorry, medyo naguluhan ako dyan, pwede mo bang i-rephrase?"
         return {"intent": "chat", "reply": fallback_reply}
 

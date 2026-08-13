@@ -1,11 +1,12 @@
 import logging
 from typing import Optional
 
+import pytz
 from telegram import Update
 from telegram.ext import ContextTypes
 
 import db
-from config import BOT_NAME
+from config import BOT_NAME, TIMEZONE
 from intent_parser import parse_intent
 from time_utils import resolve_reminder_time, compute_next_weekly_run, compute_next_daily_run
 from integrations.jobs import fetch_junior_dev_jobs, format_jobs_message
@@ -121,7 +122,11 @@ async def _handle_reminder(update, intent, raw_text):
     reminder_text = intent.get("reminder_text") or raw_text
     db.add_reminder(update.effective_chat.id, reminder_text, run_at.isoformat())
 
-    local_str = run_at.astimezone().strftime("%b %d, %I:%M %p")
+    # Convert back to the bot's configured timezone for the confirmation message.
+    # run_at is stored as UTC; using astimezone() with no argument would convert to
+    # the *server's* local timezone (usually UTC on cloud hosts), not the user's timezone.
+    tz = pytz.timezone(TIMEZONE)
+    local_str = run_at.astimezone(tz).strftime("%b %d, %I:%M %p")
     await update.message.reply_text(f'Got it, I\'ll remind you "{reminder_text}" around {local_str}.')
 
 
