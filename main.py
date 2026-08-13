@@ -5,7 +5,9 @@ import time
 
 import requests
 from flask import Flask
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram import Update
+from telegram.error import Conflict, NetworkError
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import TELEGRAM_BOT_TOKEN, TICK_INTERVAL
 import db
@@ -48,7 +50,7 @@ def run_web_server():
 
 def keep_alive(base_url: str):
     """
-    Pings our own /health endpoint every 10 minutes
+    pings our own /health endpoint every 10 minutes
     """
     while True:
         time.sleep(600)  # sleep first; no point pinging right after startup
@@ -59,6 +61,20 @@ def keep_alive(base_url: str):
             logger.warning("Keep-alive ping failed: %s", exc)
 
 
+async def bot_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning(
+            "Telegram conflict — another instance is probably still shutting down. "
+            "Will retry automatically. (%s)",
+            err,
+        )
+    elif isinstance(err, NetworkError):
+        logger.warning("Transient Telegram network error (will retry): %s", err)
+    else:
+        logger.error("Unhandled bot exception", exc_info=err)
+
+
 def main():
     db.init_db()
 
@@ -66,6 +82,7 @@ def main():
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
 
+    # self-ping keep-alive
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if render_url:
         ka_thread = threading.Thread(target=keep_alive, args=(render_url,), daemon=True)
@@ -75,6 +92,8 @@ def main():
         logger.info("RENDER_EXTERNAL_URL not set — keep-alive disabled (fine for local dev)")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_error_handler(bot_error_handler)
 
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("help", handlers.help_cmd))
@@ -108,8 +127,7 @@ def main():
 
     logger.info("Nomi is starting...")
     logger.info("Telegram polling is starting...")
-
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

@@ -203,13 +203,22 @@ async def _handle_memory_save(update, intent):
 
 async def _handle_memory_recall(update, intent):
     key = intent.get("memory_key")
-    value = db.get_memory(update.effective_chat.id, key) if key else None
 
-    if not value:
-        await update.message.reply_text("Wala akong natatandaan diyan, sorry.")
-        return
-
-    await update.message.reply_text(f"{key}: {value}")
+    if key:
+        # specific recall: "do you remember my preference for X?"
+        value = db.get_memory(update.effective_chat.id, key)
+        if not value:
+            await update.message.reply_text(f"Wala akong natatandaan tungkol sa '{key}', sorry.")
+            return
+        await update.message.reply_text(f"{key}: {value}")
+    else:
+        # broad recall: "what do you remember about me?" — list everything
+        rows = db.list_memory(update.effective_chat.id)
+        if not rows:
+            await update.message.reply_text("Wala pa akong natatandaan tungkol sa'yo.")
+            return
+        text = "\n".join(f"• {r['key']}: {r['value']}" for r in rows)
+        await update.message.reply_text(f"Here's everything I remember about you:\n\n{text}")
 
 
 # --- group chat handling: logging, keyword triggers, and mention-based NLU ---
