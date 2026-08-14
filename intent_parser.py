@@ -17,7 +17,7 @@ reply with ONLY a JSON object, nothing else, no markdown fences, no explanation.
 
 Schema:
 {{
-  "intent": "reminder" | "scheduled_task" | "trigger_rule" | "summary" | "memory_save" | "memory_recall" | "chat",
+  "intent": "reminder" | "scheduled_task" | "trigger_rule" | "summary" | "memory_save" | "memory_recall" | "undo" | "bulk_delete" | "chat",
   "reminder_text": string or null,
   "reminder_datetime": string or null (format "YYYY-MM-DD HH:MM", resolved from the message),
   "task_type": "job_search" | "custom" or null,
@@ -28,6 +28,8 @@ Schema:
   "keyword": string or null,
   "memory_key": string or null,
   "memory_value": string or null,
+  "undo_ref": integer or null (a specific action number like "undo #3" -> 3; null means "the most recent action"),
+  "bulk_delete_target": "reminders" | "scheduled_tasks" | "trigger_rules" | "memory" or null,
   "reply": string (a short natural reply in the same language/style the user used, Taglish is fine)
 }}
 
@@ -39,6 +41,16 @@ Known facts about this user (personal memory, use if relevant, ignore if empty):
 Rules:
 - "reminder" is for one-time reminders. "scheduled_task" is for recurring things ("every Monday...").
 - "trigger_rule" is for watch-and-notify requests, e.g. "if John says urgent, tell me".
+- "undo" is for requests to reverse a previous action, e.g. "undo", "undo that", "undo the last change",
+  or "undo #3". Set undo_ref to the number if the user gave one, otherwise leave it null (meaning "the
+  most recent thing I did").
+- "bulk_delete" is for requests to remove MULTIPLE things at once, e.g. "delete all my reminders",
+  "clear my recurring tasks", "remove all my keyword alerts", "forget everything about me". Map the
+  target to reminders/scheduled_tasks/trigger_rules/memory in bulk_delete_target. This intent never
+  deletes anything by itself — it just flags what the user wants cleared, a confirmation step handles
+  the rest. Do NOT use "bulk_delete" for removing a single named item (e.g. "delete the reminder about
+  the dentist") since there's no support for targeting a single item yet — treat those as "chat" and
+  explain the limitation in "reply".
 - If the user just wants to chat or ask something with no clear action, use "chat" and put the real answer in "reply".
 - Leave a field null if you're not confident about it, don't guess wildly.
 - Never wrap the JSON in backticks.
@@ -61,6 +73,11 @@ _TOOL_CALL_INTENT_MAP = {
     "watch_keyword": "trigger_rule",
     "summarize": "summary",
     "get_summary": "summary",
+    "undo": "undo",
+    "undo_action": "undo",
+    "bulk_delete": "bulk_delete",
+    "delete_all": "bulk_delete",
+    "clear_all": "bulk_delete",
 }
 
 
