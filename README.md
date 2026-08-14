@@ -1,12 +1,7 @@
 # Nomi — AI Personal Assistant Bot
 
-A Telegram bot that understands plain-language requests and actually acts on them —
-reminders, recurring tasks, group summaries, keyword alerts, and personal memory,
-all routed through an LLM (via OpenRouter) instead of hardcoded commands.
-
-Her name is **Nomi**, built by **John Ré** — that's baked into her system prompt, so
-if you ask her who she is or who made her, she'll answer in character instead of
-giving a generic "I'm an AI language model" response.
+A Telegram bot that understands plain-language requests and acts on them:
+reminders, recurring tasks, group summaries, keyword alerts, and personal memory.
 
 ## Features
 
@@ -41,11 +36,10 @@ chat reply instead of erroring out.
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram and grab the token.
-2. Get an API key from [OpenRouter](https://openrouter.ai/).
-3. In MongoDB Atlas, make sure your database user's password is handy, and add
+2.  In MongoDB Atlas, make sure your database user's password is handy, and add
    whichever IP you're running the bot from to the cluster's Network Access list
    (Atlas blocks connections from unlisted IPs by default).
-4. Copy `.env.example` to `.env` and fill it in:
+3. Copy `.env.example` to `.env` and fill it in:
 
    ```
    cp .env.example .env
@@ -85,9 +79,6 @@ chat reply instead of erroring out.
 
 ## Known limitations
 
-- The free/small LLM model can occasionally misread a date or misclassify intent —
-  worth swapping `OPENROUTER_MODEL` for a stronger model if accuracy matters more
-  than cost.
 - Mongo calls are synchronous/blocking (via `pymongo`), which is fine at small scale
   but adds real network latency per call since Atlas is remote. Worth switching to
   `motor` (the async driver) if you're expecting heavy concurrent use.
