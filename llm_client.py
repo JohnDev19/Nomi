@@ -7,21 +7,16 @@ from config import OPENROUTER_API_KEY, OPENROUTER_MODEL
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# The free model tier gets rate-limited under normal use, so we retry a couple
-# times with a short backoff before giving up.
 MAX_RETRIES = 2
 RETRY_BACKOFF_SECONDS = 2
 
 
 class LLMUnavailableError(Exception):
-    """Raised when OpenRouter can't be reached or keeps rate-limiting us after retries."""
+    """Raised when AI can't be reached or keeps rate-limiting us after retries."""
 
 
 def chat(messages, reasoning=False, temperature=0.4):
-    """Sends a chat request to OpenRouter and returns the raw assistant message dict.
-
-    Raises LLMUnavailableError (instead of letting requests' exceptions propagate)
-    if OpenRouter is still unreachable or rate-limited after retries.
+    """Sends a chat request to AI and returns the raw assistant message dict.
     """
     payload = {
         "model": OPENROUTER_MODEL,
@@ -67,7 +62,7 @@ def chat(messages, reasoning=False, temperature=0.4):
 
 def continue_with_reasoning(prior_user_msg, assistant_msg, follow_up_text):
     """
-    Follows OpenRouter's pattern for continuing a reasoning trace across turns.
+    Follows AI's pattern for continuing a reasoning trace across turns.
     reasoning_details gets passed back unmodified so the model can pick up where it left off.
     """
     messages = [
@@ -83,7 +78,7 @@ def continue_with_reasoning(prior_user_msg, assistant_msg, follow_up_text):
 
 
 def ask(system_prompt, user_prompt):
-    """One-shot helper for when we just want plain text back, no JSON involved."""
+    """One-shot helper for when we just want plain text back."""
     message = chat(
         [
             {"role": "system", "content": system_prompt},
