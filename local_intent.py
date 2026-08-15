@@ -8,6 +8,21 @@ from dateparser.search import search_dates
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
+TIME_TOKEN = re.compile(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", re.IGNORECASE)
+MULTI_REQUEST_MARKERS = re.compile(r"\balso\b|\band then\b|\bafter that\b", re.IGNORECASE)
+WEEKDAY_MENTION = re.compile(r"\b(" + "|".join(WEEKDAYS) + r")\b", re.IGNORECASE)
+
+
+def _looks_like_multiple_requests(text):
+    """True if the message probably bundles more than one request together."""
+    time_tokens = TIME_TOKEN.findall(text)
+    if len(time_tokens) >= 2:
+        return True
+    if MULTI_REQUEST_MARKERS.search(text) and (time_tokens or WEEKDAY_MENTION.search(text)):
+        return True
+    return False
+
+
 REMINDER_TRIGGER = re.compile(r"^(remind me|paalalahanan mo ako|paalala mo)\b", re.IGNORECASE)
 
 SCHEDULED_TRIGGER = re.compile(
@@ -73,6 +88,9 @@ def try_parse(text):
     """Returns an intent dict for a recognized command pattern, or None if nothing matched."""
     stripped = (text or "").strip()
     if not stripped:
+        return None
+
+    if _looks_like_multiple_requests(stripped):
         return None
 
     # --- undo ---

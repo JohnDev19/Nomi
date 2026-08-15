@@ -142,11 +142,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 
     # parse_intent does a blocking network call (OpenRouter) plus a Mongo read; running it
     # on the event loop directly would stall the scheduler's tick job for as long as it takes.
-    intent = await asyncio.to_thread(parse_intent, chat_id, text)
+    # It returns a LIST of actions — most messages produce one, but a single message can
+    # bundle several requests together ("remind me X at 10am and also Y at 12pm..."), each
+    # of which gets dispatched and confirmed independently below.
+    actions = await asyncio.to_thread(parse_intent, chat_id, text)
+
+    for intent in actions:
+        await _dispatch_intent(update, intent, text)
+
+
+async def _dispatch_intent(update, intent, raw_text):
     kind = intent.get("intent")
 
     if kind == "reminder":
-        await _handle_reminder(update, intent, text)
+        await _handle_reminder(update, intent, raw_text)
     elif kind == "scheduled_task":
         await _handle_scheduled_task(update, intent)
     elif kind == "trigger_rule":
