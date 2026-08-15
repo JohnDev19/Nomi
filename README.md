@@ -124,3 +124,5 @@ response just gets treated as a normal chat reply instead of erroring out.
 
 Never commit your `.env` file — it holds your bot token, OpenRouter key, and Mongo
 password. `.gitignore` already excludes it.
+
+## © John Ré 
