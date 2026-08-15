@@ -8,6 +8,7 @@ import pytz
 from config import TIMEZONE, BOT_NAME, BOT_CREATOR
 from llm_client import chat, LLMUnavailableError
 import db
+import local_intent
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,15 @@ def _extract_from_tool_call(text):
 
 
 def parse_intent(chat_id, user_text):
+    # Try the free, local classifier first — covers the well-known phrasings for
+    # every structured feature (reminders, scheduled tasks, trigger rules, memory,
+    # undo, bulk delete) with zero API calls. Only messages that don't match a known
+    # pattern (i.e. actual conversation, or unusual phrasing) go to the LLM.
+    local_match = local_intent.try_parse(user_text)
+    if local_match:
+        logger.info("Matched intent '%s' locally, no LLM call needed", local_match["intent"])
+        return local_match
+
     tz = pytz.timezone(TIMEZONE)
     now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M (%A)")
     memory_rows = db.list_memory(chat_id)
