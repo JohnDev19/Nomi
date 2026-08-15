@@ -1,8 +1,9 @@
 import logging
+from datetime import datetime
 from typing import Optional
 
 import pytz
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 import db
@@ -15,6 +16,18 @@ from llm_client import ask
 logger = logging.getLogger(__name__)
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+# Bulk-delete confirmations are short-lived and single-instance (see README), so an
+# in-memory dict is fine here — no need to round-trip these through Mongo.
+# chat_id -> {"target": str, "user_id": int, "count": int}
+_pending_bulk_deletes = {}
+
+BULK_DELETE_LABELS = {
+    "reminders": "reminders",
+    "scheduled_tasks": "recurring tasks",
+    "trigger_rules": "keyword alerts",
+    "memory": "memory entries",
+}
 
 
 # --- basic commands ---
@@ -37,12 +50,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Recurring tasks - \"every Monday, send me...\"\n"
         "• Group summaries - mention me in a group and ask for a summary\n"
         "• Keyword alerts - \"if [name] says [word], notify me\" (set this up from inside the group)\n"
-        "• Personal memory - \"remember that I'm allergic to peanuts\"\n\n"
+        "• Personal memory - \"remember that I'm allergic to peanuts\"\n"
+        "• Undo - just say \"undo\" to reverse the last thing I did, or \"undo #3\" for a specific one\n"
+        "• Dangerous actions (like \"delete all my reminders\") always ask you to confirm first\n\n"
         "Commands:\n"
         "/memory - see what I remember about you\n"
         "/forget <key> - make me forget something\n"
         "/rules - list your active keyword alerts\n"
-        "/jobs - pull junior dev listings right now"
+        "/jobs - pull junior dev listings right now\n"
+        "/history - see your recent actions and their numbers (for \"undo #N\")"
     )
 
 
@@ -62,7 +78,19 @@ async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     key = " ".join(context.args)
-    db.delete_memory(update.effective_chat.id, key)
+    chat_id = update.effective_chat.id
+
+    previous = db.get_memory(chat_id, key)
+    db.delete_memory(chat_id, key)
+
+    if previous is not None:
+        db.log_action(
+            chat_id,
+            "memory_delete",
+            f'Forgot "{key}"',
+            undo_data={"type": "memory_delete", "key": key, "previous_value": previous},
+        )
+
     await update.message.reply_text(f"Okay, nakalimutan ko na yung '{key}'.")
 
 
@@ -82,6 +110,24 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def jobs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs = fetch_junior_dev_jobs()
     await update.message.reply_text(format_jobs_message(jobs))
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.get_action_history(update.effective_chat.id, limit=10)
+    if not rows:
+        await update.message.reply_text("Wala pang action history dito.")
+        return
+
+    tz = pytz.timezone(TIMEZONE)
+    lines = ["Action History", ""]
+    for r in rows:
+        ts_local = datetime.fromisoformat(r["created_at"]).astimezone(tz).strftime("%H:%M")
+        marker = " (undone)" if r.get("undone") else ""
+        lines.append(f"{r['seq']}. {ts_local} {r['description']}{marker}")
+
+    lines.append("")
+    lines.append('Say "undo" for the last one, or "undo #<number>" for a specific one.')
+    await update.message.reply_text("\n".join(lines))
 
 
 # --- private chat NLU pipeline ---
@@ -108,6 +154,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         await _handle_memory_save(update, intent)
     elif kind == "memory_recall":
         await _handle_memory_recall(update, intent)
+    elif kind == "undo":
+        await _handle_undo(update, intent)
+    elif kind == "bulk_delete":
+        await _handle_bulk_delete(update, intent)
     else:
         await update.message.reply_text(intent.get("reply") or "Sige, noted.")
 
@@ -119,8 +169,16 @@ async def _handle_reminder(update, intent, raw_text):
         await update.message.reply_text("Hindi ko ma-figure out yung time, pwede mo bang ulitin nang mas specific?")
         return
 
+    chat_id = update.effective_chat.id
     reminder_text = intent.get("reminder_text") or raw_text
-    db.add_reminder(update.effective_chat.id, reminder_text, run_at.isoformat())
+    reminder_id = db.add_reminder(chat_id, reminder_text, run_at.isoformat())
+
+    db.log_action(
+        chat_id,
+        "reminder",
+        f'Created reminder: "{reminder_text}"',
+        undo_data={"type": "reminder", "reminder_id": reminder_id},
+    )
 
     # Convert back to the bot's configured timezone for the confirmation message.
     # run_at is stored as UTC; using astimezone() with no argument would convert to
@@ -141,19 +199,28 @@ async def _handle_scheduled_task(update, intent):
 
     task_type = intent.get("task_type") or "custom"
     payload = {"text": intent.get("task_query") or "Scheduled task triggered.", "limit": 5}
+    chat_id = update.effective_chat.id
 
     if day and day.lower() in WEEKDAYS:
         day_idx = WEEKDAYS.index(day.lower())
         next_run = compute_next_weekly_run(day.lower(), hour, minute)
+        when = f"every {day.title()}"
     else:
         day_idx = None
         next_run = compute_next_daily_run(hour, minute)
+        when = "daily"
 
-    db.add_scheduled_task(
-        update.effective_chat.id, task_type, payload, day_idx, hour, minute, next_run.isoformat()
+    task_id = db.add_scheduled_task(
+        chat_id, task_type, payload, day_idx, hour, minute, next_run.isoformat()
     )
 
-    when = f"every {day.title()}" if day else "daily"
+    db.log_action(
+        chat_id,
+        "scheduled_task",
+        f"Created recurring task ({when} at {hour:02d}:{minute:02d})",
+        undo_data={"type": "scheduled_task", "task_id": task_id},
+    )
+
     await update.message.reply_text(f"Noted, I'll do that {when} at {hour:02d}:{minute:02d}.")
 
 
@@ -163,11 +230,19 @@ async def _handle_trigger_rule(update, intent):
         await update.message.reply_text("Ano yung keyword na babantayan ko?")
         return
 
-    db.add_trigger_rule(
+    chat_id = update.effective_chat.id
+    rule_id = db.add_trigger_rule(
         owner_user_id=update.effective_user.id,
-        group_chat_id=update.effective_chat.id,
+        group_chat_id=chat_id,
         watch_username=intent.get("watch_user"),
         keyword=keyword,
+    )
+
+    db.log_action(
+        chat_id,
+        "trigger_rule",
+        f'Created keyword alert for "{keyword}"',
+        undo_data={"type": "trigger_rule", "rule_id": rule_id},
     )
 
     who = intent.get("watch_user") or "anyone"
@@ -197,7 +272,17 @@ async def _handle_memory_save(update, intent):
         await update.message.reply_text("Ano ba talaga yung gusto mong tandaan ko?")
         return
 
-    db.save_memory(update.effective_chat.id, key, value)
+    chat_id = update.effective_chat.id
+    previous = db.get_memory(chat_id, key)
+    db.save_memory(chat_id, key, value)
+
+    db.log_action(
+        chat_id,
+        "memory_save",
+        f"Saved memory: {key} = {value}",
+        undo_data={"type": "memory_save", "key": key, "previous_value": previous},
+    )
+
     await update.message.reply_text(f"Naka-save na, tatandaan ko na {key}: {value}")
 
 
@@ -219,6 +304,164 @@ async def _handle_memory_recall(update, intent):
             return
         text = "\n".join(f"• {r['key']}: {r['value']}" for r in rows)
         await update.message.reply_text(f"Here's everything I remember about you:\n\n{text}")
+
+
+# --- undo ---
+
+async def _handle_undo(update, intent):
+    chat_id = update.effective_chat.id
+    ref = intent.get("undo_ref")
+
+    if ref not in (None, ""):
+        try:
+            ref = int(ref)
+        except (TypeError, ValueError):
+            ref = None
+
+    action = db.get_action_by_seq(chat_id, ref) if ref else db.get_last_undoable_action(chat_id)
+
+    if not action:
+        await update.message.reply_text("Wala akong makitang action na pwedeng i-undo.")
+        return
+
+    if action.get("undone"):
+        await update.message.reply_text(f"Na-undo ko na yung #{action['seq']} dati.")
+        return
+
+    ok, message = _reverse_action(action)
+    if ok:
+        db.mark_action_undone(action["_id"])
+
+    await update.message.reply_text(message)
+
+
+def _reverse_action(action):
+    """Applies the reverse of a logged action. Returns (success, reply_text)."""
+    data = action.get("undo_data") or {}
+    kind = data.get("type")
+    chat_id = action["chat_id"]
+
+    if kind == "reminder":
+        removed = db.delete_reminder_if_unsent(data["reminder_id"])
+        if removed:
+            return True, f"Undone #{action['seq']}: {action['description']}"
+        return False, "Hindi ko na ma-undo yun, baka na-send na yung reminder."
+
+    if kind == "scheduled_task":
+        db.deactivate_scheduled_task(data["task_id"])
+        return True, f"Undone #{action['seq']}: {action['description']}"
+
+    if kind == "trigger_rule":
+        db.deactivate_trigger_rule(data["rule_id"])
+        return True, f"Undone #{action['seq']}: {action['description']}"
+
+    if kind in ("memory_save", "memory_delete"):
+        db.restore_memory(chat_id, data["key"], data.get("previous_value"))
+        return True, f"Undone #{action['seq']}: {action['description']}"
+
+    if kind == "bulk_delete":
+        restorers = {
+            "reminders": db.restore_reminders,
+            "scheduled_tasks": db.restore_scheduled_tasks,
+            "trigger_rules": db.restore_trigger_rules,
+            "memory": db.restore_memory_bulk,
+        }
+        restorer = restorers.get(data.get("target"))
+        if not restorer:
+            return False, "Hindi ko ma-undo yun."
+        restorer(data.get("docs") or [])
+        return True, f"Undone #{action['seq']}: {action['description']}"
+
+    return False, "Hindi ko alam kung paano i-undo yun."
+
+
+# --- bulk delete (dangerous actions get a confirm/cancel step) ---
+
+async def _handle_bulk_delete(update, intent):
+    target = intent.get("bulk_delete_target")
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    counters = {
+        "reminders": lambda: db.count_reminders(chat_id),
+        "scheduled_tasks": lambda: db.count_scheduled_tasks(chat_id),
+        "trigger_rules": lambda: db.count_trigger_rules(user_id),
+        "memory": lambda: db.count_memory(chat_id),
+    }
+
+    if target not in counters:
+        await update.message.reply_text(
+            "Hindi ko sure kung ano lahat yung gusto mong i-delete, pwede mo bang linawin?"
+        )
+        return
+
+    count = counters[target]()
+    if count == 0:
+        await update.message.reply_text(f"Wala ka namang {BULK_DELETE_LABELS[target]} ngayon.")
+        return
+
+    _pending_bulk_deletes[chat_id] = {"target": target, "user_id": user_id, "count": count}
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Delete", callback_data=f"bulkdel:confirm:{chat_id}"),
+        InlineKeyboardButton("Cancel", callback_data=f"bulkdel:cancel:{chat_id}"),
+    ]])
+    await update.message.reply_text(
+        f"This will delete {count} {BULK_DELETE_LABELS[target]}.\nAre you sure?",
+        reply_markup=keyboard,
+    )
+
+
+async def bulk_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the Delete/Cancel buttons from _handle_bulk_delete."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        return
+
+    _, action, chat_id_str = parts
+    try:
+        chat_id = int(chat_id_str)
+    except ValueError:
+        return
+
+    pending = _pending_bulk_deletes.get(chat_id)
+    if not pending:
+        await query.edit_message_text("Wala nang pending na action, baka na-expire na. Try mo ulit.")
+        return
+
+    if query.from_user.id != pending["user_id"]:
+        await query.answer("Ikaw lang na nag-request nito ang pwedeng mag-confirm.", show_alert=True)
+        return
+
+    if action == "cancel":
+        del _pending_bulk_deletes[chat_id]
+        await query.edit_message_text("Okay, kinansela ko na. Walang na-delete.")
+        return
+
+    target = pending["target"]
+    deleters = {
+        "reminders": lambda: db.delete_all_reminders(chat_id),
+        "scheduled_tasks": lambda: db.delete_all_scheduled_tasks(chat_id),
+        "trigger_rules": lambda: db.delete_all_trigger_rules(pending["user_id"]),
+        "memory": lambda: db.delete_all_memory(chat_id),
+    }
+
+    docs = deleters[target]()
+    del _pending_bulk_deletes[chat_id]
+
+    db.log_action(
+        chat_id,
+        "bulk_delete",
+        f"Deleted {len(docs)} {BULK_DELETE_LABELS[target]}",
+        undo_data={"type": "bulk_delete", "target": target, "docs": docs},
+    )
+
+    await query.edit_message_text(
+        f'Done, deleted {len(docs)} {BULK_DELETE_LABELS[target]}. Say "undo" if that was a mistake.'
+    )
 
 
 # --- group chat handling: logging, keyword triggers, and mention-based NLU ---

@@ -7,7 +7,14 @@ import requests
 from flask import Flask
 from telegram import Update
 from telegram.error import Conflict, NetworkError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from config import TELEGRAM_BOT_TOKEN, TICK_INTERVAL
 import db
@@ -101,6 +108,10 @@ def main():
     app.add_handler(CommandHandler("forget", handlers.forget_cmd))
     app.add_handler(CommandHandler("rules", handlers.rules_cmd))
     app.add_handler(CommandHandler("jobs", handlers.jobs_cmd))
+    app.add_handler(CommandHandler("history", handlers.history_cmd))
+
+    # Delete / Cancel buttons on dangerous bulk-delete confirmations
+    app.add_handler(CallbackQueryHandler(handlers.bulk_delete_callback, pattern=r"^bulkdel:"))
 
     # private messages
     app.add_handler(
