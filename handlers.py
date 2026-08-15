@@ -31,6 +31,18 @@ BULK_DELETE_LABELS = {
 }
 
 
+# --- helpers ---
+
+def _resolve_notify_chat_id(update) -> int:
+    """
+    For reminders and scheduled tasks: prefer the user's private DM chat so
+    notifications don't fire into the group.  Falls back to the current chat
+    if we don't know their DM chat_id yet (they haven't /start-ed the bot in DM).
+    """
+    private_chat_id = db.get_user_chat_id(update.effective_user.id)
+    return private_chat_id if private_chat_id else update.effective_chat.id
+
+
 # --- basic commands ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,7 +71,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/forget <key> - make me forget something\n"
         "/rules - list your active keyword alerts\n"
         "/jobs - pull junior dev listings right now\n"
-        "/history - see your recent actions and their numbers (for \"undo #N\")"
+        "/history - see your recent actions and their numbers (for \"undo #N\")\n\n"
+        "⚠️ In groups, always @mention me so I see your message."
     )
 
 
@@ -181,23 +194,29 @@ async def _handle_reminder(update, intent, raw_text):
         await update.message.reply_text("Hindi ko ma-figure out yung time, pwede mo bang ulitin nang mas specific?")
         return
 
-    chat_id = update.effective_chat.id
+    # If asked from a group, fire the reminder to the user's DM so it doesn't
+    # clutter the group feed.  Falls back to the current chat if they haven't
+    # DM'd the bot yet (no private chat_id on record).
+    notify_chat_id = _resolve_notify_chat_id(update)
+    current_chat_id = update.effective_chat.id
+
     reminder_text = intent.get("reminder_text") or raw_text
-    reminder_id = db.add_reminder(chat_id, reminder_text, run_at.isoformat())
+    reminder_id = db.add_reminder(notify_chat_id, reminder_text, run_at.isoformat())
 
     db.log_action(
-        chat_id,
+        current_chat_id,
         "reminder",
         f'Created reminder: "{reminder_text}"',
         undo_data={"type": "reminder", "reminder_id": reminder_id},
     )
 
-    # Convert back to the bot's configured timezone for the confirmation message.
-    # run_at is stored as UTC; using astimezone() with no argument would convert to
-    # the *server's* local timezone (usually UTC on cloud hosts), not the user's timezone.
     tz = pytz.timezone(TIMEZONE)
     local_str = run_at.astimezone(tz).strftime("%b %d, %I:%M %p")
-    await update.message.reply_text(f'Got it, I\'ll remind you "{reminder_text}" around {local_str}.')
+
+    dm_note = " I'll DM you the reminder." if notify_chat_id != current_chat_id else ""
+    await update.message.reply_text(
+        f'Got it, I\'ll remind you "{reminder_text}" around {local_str}.{dm_note}'
+    )
 
 
 async def _handle_scheduled_task(update, intent):
@@ -211,7 +230,10 @@ async def _handle_scheduled_task(update, intent):
 
     task_type = intent.get("task_type") or "custom"
     payload = {"text": intent.get("task_query") or "Scheduled task triggered.", "limit": 5}
-    chat_id = update.effective_chat.id
+
+    # Same as reminders: send recurring task output to DM, not the group.
+    notify_chat_id = _resolve_notify_chat_id(update)
+    current_chat_id = update.effective_chat.id
 
     if day and day.lower() in WEEKDAYS:
         day_idx = WEEKDAYS.index(day.lower())
@@ -223,17 +245,20 @@ async def _handle_scheduled_task(update, intent):
         when = "daily"
 
     task_id = db.add_scheduled_task(
-        chat_id, task_type, payload, day_idx, hour, minute, next_run.isoformat()
+        notify_chat_id, task_type, payload, day_idx, hour, minute, next_run.isoformat()
     )
 
     db.log_action(
-        chat_id,
+        current_chat_id,
         "scheduled_task",
         f"Created recurring task ({when} at {hour:02d}:{minute:02d})",
         undo_data={"type": "scheduled_task", "task_id": task_id},
     )
 
-    await update.message.reply_text(f"Noted, I'll do that {when} at {hour:02d}:{minute:02d}.")
+    dm_note = " I'll send it to your DM." if notify_chat_id != current_chat_id else ""
+    await update.message.reply_text(
+        f"Noted, I'll do that {when} at {hour:02d}:{minute:02d}.{dm_note}"
+    )
 
 
 async def _handle_trigger_rule(update, intent):
@@ -264,7 +289,10 @@ async def _handle_trigger_rule(update, intent):
 async def _handle_summary(update):
     rows = db.get_today_messages(update.effective_chat.id)
     if not rows:
-        await update.message.reply_text("Wala pang messages ngayong araw na ma-summarize.")
+        await update.message.reply_text(
+            "Wala pang messages ngayong araw na ma-summarize.\n\n"
+            "⚠️ Make sure I have Group Privacy disabled in @BotFather so I can read group messages."
+        )
         return
 
     transcript = "\n".join(f"{r['username']}: {r['text']}" for r in rows)
@@ -501,6 +529,13 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     if mentioned or replied_to_bot:
+        # Store the user's username now so trigger-rule DMs can find them later.
+        # We don't know their private chat_id from a group message — that only gets
+        # recorded when they /start or DM the bot directly.
+        user = update.effective_user
+        existing_chat_id = db.get_user_chat_id(user.id)
+        db.upsert_user(user.id, existing_chat_id, user.username)
+
         cleaned = message.text.replace(f"@{bot_username}", "").strip() if bot_username else message.text
         await handle_message(update, context, text=cleaned)
 
