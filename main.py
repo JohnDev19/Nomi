@@ -56,11 +56,9 @@ def run_web_server():
 
 
 def keep_alive(base_url: str):
-    """
-    pings our own /health endpoint every 10 minutes
-    """
+    """Pings our own /health endpoint every 10 minutes."""
     while True:
-        time.sleep(600)  # sleep first; no point pinging right after startup
+        time.sleep(600)
         try:
             requests.get(f"{base_url}/health", timeout=10)
             logger.debug("Keep-alive ping OK")
@@ -85,11 +83,9 @@ async def bot_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) 
 def main():
     db.init_db()
 
-    # HTTP server thread
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
 
-    # self-ping keep-alive
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if render_url:
         ka_thread = threading.Thread(target=keep_alive, args=(render_url,), daemon=True)
@@ -109,6 +105,7 @@ def main():
     app.add_handler(CommandHandler("rules", handlers.rules_cmd))
     app.add_handler(CommandHandler("jobs", handlers.jobs_cmd))
     app.add_handler(CommandHandler("history", handlers.history_cmd))
+    app.add_handler(CommandHandler("convmode", handlers.convmode_cmd))
 
     # Delete / Cancel buttons on dangerous bulk-delete confirmations
     app.add_handler(CallbackQueryHandler(handlers.bulk_delete_callback, pattern=r"^bulkdel:"))

@@ -23,6 +23,10 @@ WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", 
 # chat_id -> {"target": str, "user_id": int, "count": int}
 _pending_bulk_deletes = {}
 
+# Reminders waiting for the user to supply a missing time/date.
+# (chat_id, user_id) -> {"text": str}
+_pending_reminders = {}
+
 BULK_DELETE_LABELS = {
     "reminders": "reminders",
     "scheduled_tasks": "recurring tasks",
@@ -43,6 +47,33 @@ def _resolve_notify_chat_id(update) -> int:
     return private_chat_id if private_chat_id else update.effective_chat.id
 
 
+def _bot_is_mentioned(message, bot_id: int, bot_username: str) -> bool:
+    """
+    Returns True when the bot was @mentioned in this group message.
+
+    Checks Telegram's message entities first (authoritative — avoids false
+    positives from the bot username appearing inside a word), then falls back
+    to a plain-text search in case entities are missing.
+    """
+    username_lower = (bot_username or "").lower()
+
+    for entity in message.entities or []:
+        # @username mention
+        if entity.type == "mention" and username_lower:
+            slice_ = message.text[entity.offset: entity.offset + entity.length]
+            if slice_.lstrip("@").lower() == username_lower:
+                return True
+        # mention of a user who has no username (rare for bots, but handle it)
+        if entity.type == "text_mention" and entity.user and entity.user.id == bot_id:
+            return True
+
+    # Plain-text fallback
+    if username_lower and f"@{username_lower}" in (message.text or "").lower():
+        return True
+
+    return False
+
+
 # --- basic commands ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,20 +90,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Here's what I can do:\n\n"
-        "• Reminders - just tell me what and when\n"
-        "• Recurring tasks - \"every Monday, send me...\"\n"
-        "• Group summaries - mention me in a group and ask for a summary\n"
-        "• Keyword alerts - \"if [name] says [word], notify me\" (set this up from inside the group)\n"
-        "• Personal memory - \"remember that I'm allergic to peanuts\"\n"
-        "• Undo - just say \"undo\" to reverse the last thing I did, or \"undo #3\" for a specific one\n"
-        "• Dangerous actions (like \"delete all my reminders\") always ask you to confirm first\n\n"
+        "• Reminders — just tell me what and when\n"
+        "• Recurring tasks — \"every Monday, send me...\"\n"
+        "• Group summaries — @mention me in a group and ask for a summary\n"
+        "• Keyword alerts — \"if [name] says [word], notify me\"\n"
+        "• Personal memory — \"remember that I'm allergic to peanuts\"\n"
+        "• Undo — say \"undo\" to reverse the last thing I did, or \"undo #3\"\n"
+        "• Dangerous actions always ask you to confirm first\n\n"
         "Commands:\n"
-        "/memory - see what I remember about you\n"
-        "/forget <key> - make me forget something\n"
-        "/rules - list your active keyword alerts\n"
-        "/jobs - pull junior dev listings right now\n"
-        "/history - see your recent actions and their numbers (for \"undo #N\")\n\n"
-        "⚠️ In groups, always @mention me so I see your message."
+        "/memory — see what I remember about you\n"
+        "/forget <key> — make me forget something\n"
+        "/rules — list your active keyword alerts\n"
+        "/jobs — pull junior dev listings right now\n"
+        "/history — see your recent actions\n"
+        "/convmode — toggle conversation (chat) mode on or off\n\n"
+        "⚠️ In groups, always @mention me or reply to my message."
     )
 
 
@@ -144,20 +176,52 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def convmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle conversation (chat) mode on or off for this chat."""
+    chat_id = update.effective_chat.id
+    current = db.get_chat_setting(chat_id, "conv_mode", default=True)
+    new_value = not current
+    db.set_chat_setting(chat_id, "conv_mode", new_value)
+
+    if new_value:
+        await update.message.reply_text(
+            "✅ Conversation mode is ON — I'll reply to casual messages and chat normally."
+        )
+    else:
+        await update.message.reply_text(
+            "🔕 Conversation mode is OFF — I'll only handle reminders, tasks, alerts, "
+            "and memory. Use /convmode again to turn it back on."
+        )
+
+
 # --- private chat NLU pipeline ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: Optional[str] = None):
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
     text = text or update.message.text
 
     if update.effective_chat.type == "private":
-        db.upsert_user(update.effective_user.id, chat_id, update.effective_user.username)
+        db.upsert_user(user_id, chat_id, update.effective_user.username)
+
+    # --- pending reminder follow-up ---
+    # If a previous reminder had no time/date and we asked the user to supply one,
+    # treat this message as the answer before running the full NLU pipeline.
+    pending_key = (chat_id, user_id)
+    if pending_key in _pending_reminders:
+        pending = _pending_reminders.pop(pending_key)
+        run_at = resolve_reminder_time(None, text)
+        if run_at:
+            await _complete_pending_reminder(update, pending, run_at)
+        else:
+            await update.message.reply_text(
+                "Hindi ko pa rin ma-figure out ang oras. "
+                'Subukan mo ulit mula sa simula, e.g. "remind me to call mom tomorrow at 3pm".'
+            )
+        return
 
     # parse_intent does a blocking network call (OpenRouter) plus a Mongo read; running it
     # on the event loop directly would stall the scheduler's tick job for as long as it takes.
-    # It returns a LIST of actions — most messages produce one, but a single message can
-    # bundle several requests together ("remind me X at 10am and also Y at 12pm..."), each
-    # of which gets dispatched and confirmed independently below.
     actions = await asyncio.to_thread(parse_intent, chat_id, text)
 
     for intent in actions:
@@ -166,6 +230,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 
 async def _dispatch_intent(update, intent, raw_text):
     kind = intent.get("intent")
+
+    # When conversation mode is off, silently drop AI chat replies so
+    # they don't steal messages the user meant as reminders.
+    if kind == "chat":
+        conv_on = db.get_chat_setting(update.effective_chat.id, "conv_mode", default=True)
+        if not conv_on:
+            return
 
     if kind == "reminder":
         await _handle_reminder(update, intent, raw_text)
@@ -191,12 +262,19 @@ async def _handle_reminder(update, intent, raw_text):
     run_at = resolve_reminder_time(intent.get("reminder_datetime"), raw_text)
 
     if not run_at:
-        await update.message.reply_text("Hindi ko ma-figure out yung time, pwede mo bang ulitin nang mas specific?")
+        # No time/date found — store the reminder text and ask for it.
+        reminder_text = intent.get("reminder_text") or raw_text
+        pending_key = (update.effective_chat.id, update.effective_user.id if update.effective_user else None)
+        _pending_reminders[pending_key] = {"text": reminder_text}
+        await update.message.reply_text(
+            f'Got it — remind you to "{reminder_text}".\n\n'
+            f'When? Reply with the time, like "tomorrow at 3pm" or "Friday at 9am".'
+        )
         return
 
     # If asked from a group, fire the reminder to the user's DM so it doesn't
-    # clutter the group feed.  Falls back to the current chat if they haven't
-    # DM'd the bot yet (no private chat_id on record).
+    # clutter the group feed. Falls back to the current chat if they haven't DM'd
+    # the bot yet (no private chat_id on record).
     notify_chat_id = _resolve_notify_chat_id(update)
     current_chat_id = update.effective_chat.id
 
@@ -212,10 +290,32 @@ async def _handle_reminder(update, intent, raw_text):
 
     tz = pytz.timezone(TIMEZONE)
     local_str = run_at.astimezone(tz).strftime("%b %d, %I:%M %p")
-
     dm_note = " I'll DM you the reminder." if notify_chat_id != current_chat_id else ""
     await update.message.reply_text(
         f'Got it, I\'ll remind you "{reminder_text}" around {local_str}.{dm_note}'
+    )
+
+
+async def _complete_pending_reminder(update, pending: dict, run_at):
+    """Called when the user supplies a time/date for a previously incomplete reminder."""
+    notify_chat_id = _resolve_notify_chat_id(update)
+    current_chat_id = update.effective_chat.id
+
+    reminder_text = pending["text"]
+    reminder_id = db.add_reminder(notify_chat_id, reminder_text, run_at.isoformat())
+
+    db.log_action(
+        current_chat_id,
+        "reminder",
+        f'Created reminder: "{reminder_text}"',
+        undo_data={"type": "reminder", "reminder_id": reminder_id},
+    )
+
+    tz = pytz.timezone(TIMEZONE)
+    local_str = run_at.astimezone(tz).strftime("%b %d, %I:%M %p")
+    dm_note = " I'll DM you the reminder." if notify_chat_id != current_chat_id else ""
+    await update.message.reply_text(
+        f'Done! I\'ll remind you "{reminder_text}" at {local_str}.{dm_note}'
     )
 
 
@@ -291,7 +391,7 @@ async def _handle_summary(update):
     if not rows:
         await update.message.reply_text(
             "Wala pang messages ngayong araw na ma-summarize.\n\n"
-            "⚠️ Make sure I have Group Privacy disabled in @BotFather so I can read group messages."
+            "⚠️ Make sure Group Privacy is disabled in @BotFather so I can read group messages."
         )
         return
 
@@ -337,14 +437,12 @@ async def _handle_memory_recall(update, intent):
     key = intent.get("memory_key")
 
     if key:
-        # specific recall: "do you remember my preference for X?"
         value = db.get_memory(update.effective_chat.id, key)
         if not value:
             await update.message.reply_text(f"Wala akong natatandaan tungkol sa '{key}', sorry.")
             return
         await update.message.reply_text(f"{key}: {value}")
     else:
-        # broad recall: "what do you remember about me?" — list everything
         rows = db.list_memory(update.effective_chat.id)
         if not rows:
             await update.message.reply_text("Wala pa akong natatandaan tungkol sa'yo.")
@@ -422,7 +520,7 @@ def _reverse_action(action):
     return False, "Hindi ko alam kung paano i-undo yun."
 
 
-# --- bulk delete (dangerous actions get a confirm/cancel step) ---
+# --- bulk delete ---
 
 async def _handle_bulk_delete(update, intent):
     target = intent.get("bulk_delete_target")
@@ -460,7 +558,6 @@ async def _handle_bulk_delete(update, intent):
 
 
 async def bulk_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles taps on the Delete/Cancel buttons from _handle_bulk_delete."""
     query = update.callback_query
     await query.answer()
 
@@ -511,7 +608,7 @@ async def bulk_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-# --- group chat handling: logging, keyword triggers, and mention-based NLU ---
+# --- group chat handling ---
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -520,23 +617,27 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await _log_and_check_triggers(update, context)
 
-    bot_username = context.bot.username
-    mentioned = bool(bot_username) and f"@{bot_username}".lower() in message.text.lower()
+    bot_id = context.bot.id
+    bot_username = context.bot.username  # no @ prefix
+
+    mentioned = _bot_is_mentioned(message, bot_id, bot_username)
     replied_to_bot = (
         message.reply_to_message
         and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.id == context.bot.id
+        and message.reply_to_message.from_user.id == bot_id
     )
 
     if mentioned or replied_to_bot:
-        # Store the user's username now so trigger-rule DMs can find them later.
-        # We don't know their private chat_id from a group message — that only gets
-        # recorded when they /start or DM the bot directly.
+        # Persist username without overwriting an existing private chat_id.
         user = update.effective_user
         existing_chat_id = db.get_user_chat_id(user.id)
         db.upsert_user(user.id, existing_chat_id, user.username)
 
-        cleaned = message.text.replace(f"@{bot_username}", "").strip() if bot_username else message.text
+        # Strip the @mention from the text so the NLU only sees the actual request.
+        cleaned = message.text
+        if bot_username:
+            cleaned = cleaned.replace(f"@{bot_username}", "").strip()
+
         await handle_message(update, context, text=cleaned)
 
 
@@ -555,7 +656,6 @@ async def _log_and_check_triggers(update: Update, context: ContextTypes.DEFAULT_
         if rule["keyword"] not in message.text.lower():
             continue
 
-        # prefer DMing the person who set the rule, fall back to the group if we don't know them yet
         target_chat = db.get_user_chat_id(rule["owner_user_id"]) or rule["group_chat_id"]
         await context.bot.send_message(
             chat_id=target_chat,

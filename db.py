@@ -16,6 +16,7 @@ group_messages_col = _db.group_messages
 users_col = _db.users
 action_history_col = _db.action_history
 counters_col = _db.counters
+chat_settings_col = _db.chat_settings
 
 
 def init_db():
@@ -27,6 +28,7 @@ def init_db():
         scheduled_tasks_col.create_index([("active", ASCENDING), ("next_run", ASCENDING)])
         group_messages_col.create_index([("chat_id", ASCENDING), ("ts", ASCENDING)])
         action_history_col.create_index([("chat_id", ASCENDING), ("seq", ASCENDING)], unique=True)
+        chat_settings_col.create_index([("chat_id", ASCENDING), ("key", ASCENDING)], unique=True)
     except PyMongoError as exc:
         raise RuntimeError(
             "Couldn't reach MongoDB. Double-check MONGODB_URI/MONGODB_PASSWORD, and make sure "
@@ -224,7 +226,7 @@ def restore_memory_bulk(docs):
         memory_col.insert_many(docs)
 
 
-# --- group message log, this is what daily summaries get built from ---
+# --- group message log ---
 
 def log_group_message(chat_id, username, text):
     group_messages_col.insert_one({
@@ -243,12 +245,15 @@ def get_today_messages(chat_id):
     return list(cursor)
 
 
-# --- users, so trigger alerts can find the right person to DM ---
+# --- users ---
 
 def upsert_user(user_id, chat_id, username):
+    update_fields = {"username": username, "updated_at": now_iso()}
+    if chat_id is not None:
+        update_fields["chat_id"] = chat_id
     users_col.update_one(
         {"_id": user_id},
-        {"$set": {"chat_id": chat_id, "username": username, "updated_at": now_iso()}},
+        {"$set": update_fields},
         upsert=True,
     )
 
@@ -258,12 +263,22 @@ def get_user_chat_id(user_id):
     return row["chat_id"] if row else None
 
 
-# --- action history, powers "undo" ---
-#
-# Every reversible action (reminder created, memory saved, task scheduled, bulk delete, etc.)
-# gets logged here with enough info in `undo_data` to reverse it later. Actions are numbered
-# per-chat via `seq` (an incrementing counter) so the user can say "undo #3" and get exactly
-# the action shown as #3 in /history.
+# --- chat settings (e.g. conversation mode toggle) ---
+
+def get_chat_setting(chat_id, key, default=None):
+    row = chat_settings_col.find_one({"chat_id": chat_id, "key": key})
+    return row["value"] if row else default
+
+
+def set_chat_setting(chat_id, key, value):
+    chat_settings_col.update_one(
+        {"chat_id": chat_id, "key": key},
+        {"$set": {"value": value, "updated_at": now_iso()}},
+        upsert=True,
+    )
+
+
+# --- action history ---
 
 def _next_action_seq(chat_id):
     doc = counters_col.find_one_and_update(
@@ -293,7 +308,7 @@ def log_action(chat_id, action_type, description, undo_data=None):
 
 def get_action_history(chat_id, limit=10):
     rows = list(action_history_col.find({"chat_id": chat_id}).sort("seq", -1).limit(limit))
-    rows.reverse()  # oldest first, so numbers read top-to-bottom in order they happened
+    rows.reverse()
     return rows
 
 
