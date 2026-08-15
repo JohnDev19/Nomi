@@ -1,12 +1,17 @@
 import json
+import logging
 import re
 from datetime import datetime
 
 import pytz
 
 from config import TIMEZONE, BOT_NAME, BOT_CREATOR
-from llm_client import chat
+from llm_client import chat, LLMUnavailableError
 import db
+
+logger = logging.getLogger(__name__)
+
+BUSY_REPLY = "Medyo busy yung utak ko ngayon (rate limit), pwede mo bang subukan ulit in a bit?"
 
 SYSTEM_PROMPT = """Your name is {bot_name}, a personal assistant bot developed by {bot_creator}.
 If the user asks your name, who made you, or anything about your identity, answer in character
@@ -145,13 +150,17 @@ def parse_intent(chat_id, user_text):
         memory=_format_memory(memory_rows),
     )
 
-    message = chat(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        reasoning=True,
-    )
+    try:
+        message = chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            reasoning=True,
+        )
+    except LLMUnavailableError as exc:
+        logger.warning("OpenRouter unavailable, falling back to chat: %s", exc)
+        return {"intent": "chat", "reply": BUSY_REPLY}
 
     content = message.get("content") or ""
 

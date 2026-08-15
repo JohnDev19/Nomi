@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -11,7 +12,7 @@ from config import BOT_NAME, TIMEZONE
 from intent_parser import parse_intent
 from time_utils import resolve_reminder_time, compute_next_weekly_run, compute_next_daily_run
 from integrations.jobs import fetch_junior_dev_jobs, format_jobs_message
-from llm_client import ask
+from llm_client import ask, LLMUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     if update.effective_chat.type == "private":
         db.upsert_user(update.effective_user.id, chat_id, update.effective_user.username)
 
-    intent = parse_intent(chat_id, text)
+    # parse_intent does a blocking network call (OpenRouter) plus a Mongo read; running it
+    # on the event loop directly would stall the scheduler's tick job for as long as it takes.
+    intent = await asyncio.to_thread(parse_intent, chat_id, text)
     kind = intent.get("intent")
 
     if kind == "reminder":
@@ -256,11 +259,18 @@ async def _handle_summary(update):
         return
 
     transcript = "\n".join(f"{r['username']}: {r['text']}" for r in rows)
-    summary = ask(
-        "Summarize the following group chat log into a short set of bullet points, "
-        "focused on decisions, deadlines, and anything worth remembering. Keep it brief.",
-        transcript,
-    )
+
+    try:
+        summary = await asyncio.to_thread(
+            ask,
+            "Summarize the following group chat log into a short set of bullet points, "
+            "focused on decisions, deadlines, and anything worth remembering. Keep it brief.",
+            transcript,
+        )
+    except LLMUnavailableError:
+        await update.message.reply_text("Medyo busy yung utak ko ngayon, subukan mo ulit in a bit.")
+        return
+
     await update.message.reply_text(f"Here's today's summary:\n\n{summary}")
 
 
